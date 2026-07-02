@@ -775,7 +775,7 @@ static uint32_t stripe_checksum(const uint8_t *output,
 #ifdef YOLO_TFMA_INT8
 static int8_t clamp_i8(float v)
 {
-    int32_t i{(int32_t)(v + (v >= 0.0f ? 0.5f : -0.5f))};
+    int32_t i = (int32_t)(v + (v >= 0.0f ? 0.5f : -0.5f));
     if (i > 127) i = 127;
     if (i < -128) i = -128;
     return (int8_t)i;
@@ -783,31 +783,32 @@ static int8_t clamp_i8(float v)
 
 static void quantize_conv1_w(uint8_t *base, const float *weights)
 {
-    int8_t *const wint8{(int8_t *)(base + WINT8_OFFSET)};
-    float *const wscale{(float *)(base + WSCALE_OFFSET)};
+    int8_t *const wint8 = (int8_t *)(base + WINT8_OFFSET);
+    float *const wscale = (float *)(base + WSCALE_OFFSET);
 
-    for (uint32_t b{0}; b < YOLO_BLOCKS; ++b) {
+    for (uint32_t b = 0; b < YOLO_BLOCKS; ++b) {
         const float *const w = weights + b * BLOCK_WEIGHTS + CONV3_WEIGHTS;
-        
-        for (uint32_t oc{0}; oc < CH; ++oc) {
-            float mx{0.0f};
-            
-            for (uint32_t ic{0}; ic < CH; ++ic) {
-                float a = std::abs(w[oc * CH + ic]);
-                mx = std::max(mx, a);
+
+        for (uint32_t oc = 0; oc < CH; ++oc) {
+            float mx = 0.0f;
+
+            for (uint32_t ic = 0; ic < CH; ++ic) {
+                float a = w[oc * CH + ic];
+                if (a < 0.0f) a = -a;
+                if (a > mx) mx = a;
             }
-            
-            float scale{mx == 0.0f ? 1.0f : mx / 127.0f};
+
+            float scale = mx == 0.0f ? 1.0f : mx / 127.0f;
             wscale[b * CH + oc] = scale;
 
-            const float inv{1.0f / scale};
-            int8_t *const d{wint8 + (b * CH + oc) * 64u};
-            
-            for (uint32_t ic{0}; ic < CH; ++ic) {
+            const float inv = 1.0f / scale;
+            int8_t *const d = wint8 + (b * CH + oc) * 64u;
+
+            for (uint32_t ic = 0; ic < CH; ++ic) {
                 d[ic] = clamp_i8(w[oc * CH + ic] * inv);
             }
-            
-            for (uint32_t ic{CH}; ic < 64u; ++ic) {
+
+            for (uint32_t ic = CH; ic < 64u; ++ic) {
                 d[ic] = 0;
             }
         }
@@ -815,23 +816,24 @@ static void quantize_conv1_w(uint8_t *base, const float *weights)
 }
 static float quantize_act_stripe(const float *src, int8_t *aint8, uint32_t p0, uint32_t p1)
 {
-float mx{0.0f};
-    
-    for (uint32_t p{p0}; p < p1; ++p) {
-        for (uint32_t c{0}; c < CH; c++) {
+float mx = 0.0f;
+
+    for (uint32_t p = p0; p < p1; ++p) {
+        for (uint32_t c = 0; c < CH; c++) {
             float val = src[p * CH + c];
-            float a = std::abs(val); 
-            mx = std::max(mx, a);
+            float a = val;
+            if (a < 0.0f) a = -a;
+            if (a > mx) mx = a;
         }
     }
 
-    float scale{mx == 0.0f ? 1.0f : mx / 127.0f};
-    const float inv{1.0f / scale};
+    float scale = mx == 0.0f ? 1.0f : mx / 127.0f;
+    const float inv = 1.0f / scale;
 
-    for (uint32_t p{p0}; p < p1; ++p) {
-        int8_t *const d{aint8 + p * 64u};
-        
-        for (uint32_t c{0}; c < CH; ++c) {
+    for (uint32_t p = p0; p < p1; ++p) {
+        int8_t *const d = aint8 + p * 64u;
+
+        for (uint32_t c = 0; c < CH; ++c) {
             d[c] = clamp_i8(src[p * CH + c] * inv);
         }
         
@@ -843,13 +845,13 @@ float mx{0.0f};
     return scale;
 }
 
-static void conv1x1_tfma_int8(uint8_t *base, const float *src; uint32_t block, float *output, uint32_t row0, uint32_t row1)
+static void conv1x1_tfma_int8(uint8_t *base, const float *src, uint32_t block, float *output, uint32_t row0, uint32_t row1)
 {
-	int8_t *const aint8{(int8_t *)(base + AINT8_OFFSET)};
-	const int8_t *const wint8{(const int8_t *)(base + WINT8_OFFSET)+ block * CH * 64u};
-	const float *const wscale{(const float *)(base + WSCALE_OFFSET)+ block * CH};
-	const uint32_t p0{row0 * IMG_W};
-	const uint32_t p1{row1 * IMG_W};
+	int8_t *const aint8 = (int8_t *)(base + AINT8_OFFSET);
+	const int8_t *const wint8 = (const int8_t *)(base + WINT8_OFFSET)+ block * CH * 64u;
+	const float *const wscale = (const float *)(base + WSCALE_OFFSET)+ block * CH;
+	const uint32_t p0 = row0 * IMG_W;
+	const uint32_t p1 = row1 * IMG_W;
 
 	const float act_scale = quantize_act_stripe(src, aint8, p0, p1);
 	FENCE;
@@ -859,8 +861,8 @@ static void conv1x1_tfma_int8(uint8_t *base, const float *src; uint32_t block, f
     tensor_load(false, false, 0, 0, 1, (uint64_t)wint8, 0, CH - 1u, 64u, 1);
     tensor_wait(TENSOR_LOAD_WAIT_1);
 
-    for (uint32_t p{p0}; p < p1; p += 16u) {
-        const uint32_t npix{(p + 16u <= p1) ? 16u : (p1 - p)};
+    for (uint32_t p = p0; p < p1; p += 16u) {
+        const uint32_t npix = (p + 16u <= p1) ? 16u : (p1 - p);
         tensor_load(false, false, 0, 0, 0, (uint64_t)(aint8 + p * 64u), 0, npix - 1u, 64u, 0);
         tensor_wait(TENSOR_LOAD_WAIT_0);
         tensor_fma(false,            // use_tmask 
@@ -888,7 +890,7 @@ static void conv1x1_tfma_int8(uint8_t *base, const float *src; uint32_t block, f
         for (uint32_t c = 0; c < CH; c++) {
             int32_t raw;
             __builtin_memcpy(&raw, &output[p * CH + c], sizeof(int32_t));
-            float v{(float)raw * act_scale * wscale[c] * CONV1_SCALE};
+            float v = (float)raw * act_scale * wscale[c] * CONV1_SCALE;
             output[p * CH + c] = relu6_f32(v);
         }
     FENCE;
@@ -919,6 +921,10 @@ int main(uintptr_t arg_area)
 
 	const uint32_t row0 = (IMG_H * hart_id) / ACTIVE_HARTS;
 	const uint32_t row1 = (IMG_H * (hart_id + 1u)) / ACTIVE_HARTS;
+
+	#ifdef YOLO_TFMA_INT8
+	uint32_t tfma_error = 0;
+	#endif
 
 	if (hart_id == 0u) {
 		init_model(input, weights);
@@ -964,7 +970,14 @@ int main(uintptr_t arg_area)
 
 			evict_activation_read_float(src, row0, row1);
 			WAIT_CACHEOPS;
+			#ifdef YOLO_TFMA_INT8
+			conv1x1_tfma_int8(base, src, block, dst, row0, row1);
+			if (hart_id == 0u && pass == 0u && block == 0u) {
+				tfma_error = (uint32_t)get_tensor_error();
+			}
+			#else
 			conv1x1_fp(src, conv1_w, dst, row0, row1);
+			#endif
 			FENCE;
 			evict_activation_write_float(dst, row0, row1);
 			WAIT_CACHEOPS;
@@ -1050,6 +1063,9 @@ int main(uintptr_t arg_area)
 		summary->ops_lo = (uint32_t)ops;
 		summary->ops_hi = (uint32_t)(ops >> 32);
 		summary->head_channels = HEAD_CH;
+		#ifdef YOLO_TFMA_INT8
+		summary->reserved[0] = tfma_error;
+		#endif
 
 		FENCE;
 		evict(summary, sizeof(*summary));
