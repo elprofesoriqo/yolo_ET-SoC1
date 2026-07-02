@@ -42,6 +42,8 @@ names=(
 	y10_07_oc2_blocks3
 	y10_08_oc2_blocks5
 	y10_09_oc2_ofast
+
+	y10_10_tfma_int8
 )
 
 opts=(
@@ -55,6 +57,9 @@ opts=(
 	"-O3 -DYOLO_VPU_OC2=1 -DYOLO_BLOCKS=3"
 	"-O3 -DYOLO_VPU_OC2=1 -DYOLO_BLOCKS=5"
 	"-Ofast -DYOLO_VPU_OC2=1 -DYOLO_PREFETCH_WEIGHTS=1"
+	
+	"-O3 -DYOLO_VPU_OC2=1 -DYOLO_TFMA_INT8=1"
+
 )
 
 : > "${OUT}/yolo_10_variants.txt"
