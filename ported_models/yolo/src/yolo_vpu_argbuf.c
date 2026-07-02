@@ -12,6 +12,7 @@
 #include "erbium/isa/barriers.h"
 #include "erbium/isa/cacheops-umode.h"
 #include "erbium/isa/hart.h"
+#include "erbium/isa/tensors.h"
 
 extern char heap0_end[];
 
@@ -55,6 +56,10 @@ extern char heap0_end[];
 #define ACT0_OFFSET       0x80000u
 #define ACT1_OFFSET       0xF0000u
 #define OUTPUT_OFFSET     0x160000u
+
+#define WINT8_OFFSET   0x180000u   // INT8 weights: YOLO_BLOCKS * CH * 64B
+#define WSCALE_OFFSET  0x182000u   // FP32: YOLO_BLOCKS * CH floats
+#define AINT8_OFFSET   0x190000u   // INT8 activations: IMG_W*IMG_H * 64B
 
 #define BENCH_FLB         2u
 #define BENCH_FCC         FCC_0
@@ -767,6 +772,80 @@ static uint32_t stripe_checksum(const uint8_t *output,
 	return sum;
 }
 
+#ifdef YOLO_TFMA_INT8
+static int8_t clamp_i8(float v)
+{
+    int32_t i{(int32_t)(v + (v >= 0.0f ? 0.5f : -0.5f))};
+    if (i > 127) i = 127;
+    if (i < -128) i = -128;
+    return (int8_t)i;
+}
+
+static void quantize_conv1_w(uint8_t *base, const float *weights)
+{
+    int8_t *const wint8{(int8_t *)(base + WINT8_OFFSET)};
+    float *const wscale{(float *)(base + WSCALE_OFFSET)};
+
+    for (uint32_t b{0}; b < YOLO_BLOCKS; ++b) {
+        const float *const w = weights + b * BLOCK_WEIGHTS + CONV3_WEIGHTS;
+        
+        for (uint32_t oc{0}; oc < CH; ++oc) {
+            float mx{0.0f};
+            
+            for (uint32_t ic{0}; ic < CH; ++ic) {
+                float a = std::abs(w[oc * CH + ic]);
+                mx = std::max(mx, a);
+            }
+            
+            float scale{mx == 0.0f ? 1.0f : mx / 127.0f};
+            wscale[b * CH + oc] = scale;
+
+            const float inv{1.0f / scale};
+            int8_t *const d{wint8 + (b * CH + oc) * 64u};
+            
+            for (uint32_t ic{0}; ic < CH; ++ic) {
+                d[ic] = clamp_i8(w[oc * CH + ic] * inv);
+            }
+            
+            for (uint32_t ic{CH}; ic < 64u; ++ic) {
+                d[ic] = 0;
+            }
+        }
+    }
+}
+static float quantize_act_stripe(const float *src, int8_t *aint8, uint32_t p0, uint32_t p1)
+{
+float mx{0.0f};
+    
+    for (uint32_t p{p0}; p < p1; ++p) {
+        for (uint32_t c{0}; c < CH; c++) {
+            float val = src[p * CH + c];
+            float a = std::abs(val); 
+            mx = std::max(mx, a);
+        }
+    }
+
+    float scale{mx == 0.0f ? 1.0f : mx / 127.0f};
+    const float inv{1.0f / scale};
+
+    for (uint32_t p{p0}; p < p1; ++p) {
+        int8_t *const d{aint8 + p * 64u};
+        
+        for (uint32_t c{0}; c < CH; ++c) {
+            d[c] = clamp_i8(src[p * CH + c] * inv);
+        }
+        
+        for (uint32_t c = CH; c < 64u; ++c) {
+            d[c] = 0;
+        }
+    }
+    
+    return scale;
+}
+
+
+#endif
+
 int main(uintptr_t arg_area)
 {
 	const uint32_t hart_id = bench_hart_id();
@@ -792,9 +871,19 @@ int main(uintptr_t arg_area)
 
 	if (hart_id == 0u) {
 		init_model(input, weights);
+		
+		#ifdef YOLO_TFMA_INT8
+		quantize_conv1_w(base, weights);
+		#endif
+
 		FENCE;
 		evict(input, ACT_BYTES);
 		evict(weights, WEIGHT_BYTES);
+
+		#ifdef YOLO_TFMA_INT8
+		evict(base + WINT8_OFFSET, YOLO_BLOCKS * CH * 64u);
+		evict(base + WSCALE_OFFSET, YOLO_BLOCKS * CH * sizeof(float));
+		#endif
 		WAIT_CACHEOPS;
 	}
 	bench_barrier();
