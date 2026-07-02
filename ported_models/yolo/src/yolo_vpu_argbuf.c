@@ -843,7 +843,58 @@ float mx{0.0f};
     return scale;
 }
 
+static void conv1x1_tfma_int8(uint8_t *base, const float *src; uint32_t block, float *output, uint32_t row0, uint32_t row1)
+{
+	int8_t *const aint8{(int8_t *)(base + AINT8_OFFSET)};
+	const int8_t *const wint8{(const int8_t *)(base + WINT8_OFFSET)+ block * CH * 64u};
+	const float *const wscale{(const float *)(base + WSCALE_OFFSET)+ block * CH};
+	const uint32_t p0{row0 * IMG_W};
+	const uint32_t p1{row1 * IMG_W};
 
+	const float act_scale = quantize_act_stripe(src, aint8, p0, p1);
+	FENCE;
+	evict(aint8 + p0 * 64u, (p1 - p0) * 64u);
+    WAIT_CACHEOPS;
+
+    tensor_load(false, false, 0, 0, 1, (uint64_t)wint8, 0, CH - 1u, 64u, 1);
+    tensor_wait(TENSOR_LOAD_WAIT_1);
+
+    for (uint32_t p{p0}; p < p1; p += 16u) {
+        const uint32_t npix{(p + 16u <= p1) ? 16u : (p1 - p)};
+        tensor_load(false, false, 0, 0, 0, (uint64_t)(aint8 + p * 64u), 0, npix - 1u, 64u, 0);
+        tensor_wait(TENSOR_LOAD_WAIT_0);
+        tensor_fma(false,            // use_tmask 
+                   (CH / 4u) - 1u,   // b_num_col: 16 output channels
+                   npix - 1u,        // a_num_rows
+                   (CH / 4u) - 1u,   // a_num_cols: contract 16 input channels
+                   0,                // offset 
+                   true,             // tenc_loc: copy TenC -> FREGs for store
+                   false, false,     // signed weights, signed activations
+                   true,             // tenb_loc: B from TenB
+                   0, 0,             // scp_loc_b (ignored), scp_loc_a = line 0
+                   3,                // opcode: INT8
+                   true);            // first_pass: zero the accumulator
+        tensor_wait(TENSOR_FMA_WAIT);
+
+        tensor_store(0, 0, (CH / 4u) - 1u, npix - 1u, (uint64_t)((uint8_t *)output + p * 64u), 0, 64u);
+        tensor_wait(TENSOR_STORE_WAIT);
+    }
+
+    FENCE;
+    evict(output + p0 * CH, (p1 - p0) * CH * sizeof(float));
+    WAIT_CACHEOPS;
+
+    for (uint32_t p = p0; p < p1; p++)
+        for (uint32_t c = 0; c < CH; c++) {
+            int32_t raw;
+            __builtin_memcpy(&raw, &output[p * CH + c], sizeof(int32_t));
+            float v{(float)raw * act_scale * wscale[c] * CONV1_SCALE};
+            output[p * CH + c] = relu6_f32(v);
+        }
+    FENCE;
+    evict(output + p0 * CH, (p1 - p0) * CH * sizeof(float));
+    WAIT_CACHEOPS;
+}
 #endif
 
 int main(uintptr_t arg_area)
