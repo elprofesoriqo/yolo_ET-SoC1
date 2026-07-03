@@ -1082,6 +1082,7 @@ int main(uintptr_t arg_area)
 		#endif
 
 		FENCE;
+		evict(final_output, OUT_BYTES);
 		evict(summary, sizeof(*summary));
 		WAIT_CACHEOPS;
 	}
