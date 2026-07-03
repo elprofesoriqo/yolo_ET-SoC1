@@ -72,8 +72,8 @@ def resolve_zero_bin() -> str:
     if config.ZERO_BIN and Path(config.ZERO_BIN).is_file():
         return config.ZERO_BIN
     for p in [
-        config.REPO_ROOT / "local-artifacts/erbium_amp_probe/zero2m.bin",
-        config.REPO_ROOT / "local-artifacts/erbium_amp_probe/dncnn3-bench/zero2m.bin",
+        config.MODEL_PORT_ARTIFACTS / "zero2m.bin",
+        config.MODEL_PORT_ARTIFACTS / "dncnn3-bench/zero2m.bin",
     ]:
         if p.is_file():
             return str(p)
@@ -183,7 +183,7 @@ def _resolve_smoke_elf() -> str:
         return elf
     for alt in [
         config.REPO_ROOT / "local-artifacts/kernels/histogram.erbium-soc1sim.elf",
-        config.REPO_ROOT / "local-artifacts/erbium_amp_probe/yolo-bench/y10_00_base.elf",
+        config.MODEL_PORT_ARTIFACTS / "yolo-bench/y10_00_base.elf",
     ]:
         if alt.is_file():
             return str(alt)
@@ -241,12 +241,12 @@ def run_board_benchmark_legacy(job_id: str, model: str) -> dict:
         variant = cfg["models"][model]["canonical_variant"]
         bench_dir = cfg["models"][model]["bench_dir"]
         elf_name = f"{variant}.elf"
-        amp = config.REPO_ROOT / "local-artifacts/erbium_amp_probe" / bench_dir / elf_name
-        if not amp.is_file():
+        elf = config.MODEL_PORT_ARTIFACTS / bench_dir / elf_name
+        if not elf.is_file():
             raise FileNotFoundError(f"ELF not found for board run: {elf_name}")
         extra = []
         if model == "dncnn":
-            base = config.REPO_ROOT / "local-artifacts/erbium_amp_probe/dncnn3-bench"
+            base = config.MODEL_PORT_ARTIFACTS / "dncnn3-bench"
             for name, off in [("dncnn3_input.bin", "0x2000"), ("dncnn3_weights.bin", "0x4000")]:
                 p = base / name
                 if p.is_file():
@@ -254,7 +254,7 @@ def run_board_benchmark_legacy(job_id: str, model: str) -> dict:
         return run_kernel(
             job_id=job_id,
             device="soc1sim",
-            elf=str(amp),
+            elf=str(elf),
             stage="board",
             extra_file_loads=extra or None,
         )

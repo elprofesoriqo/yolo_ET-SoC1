@@ -5,8 +5,9 @@ set -uo pipefail
 # Local only: no ssh, scp, rsync, or board access.
 
 CHECKOUT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AMP="$CHECKOUT/local-artifacts/erbium_amp_probe"
-DEFAULT_LAUNCHER="$AMP/whisper-real/host-dynmem/build/erbium_soc1sim_argbuf_dynmem"
+ARTIFACTS="${BENCHMARK_ARTIFACT_ROOT:-${AMP_ROOT:-$CHECKOUT/local-artifacts/model-port-benchmarks}}"
+DEFAULT_BUILD_ROOT="${BUILD_ROOT:-$CHECKOUT/.ci-work/build}"
+DEFAULT_LAUNCHER="${LAUNCHER:-$DEFAULT_BUILD_ROOT/erbium_soc1sim_argbuf/erbium_soc1sim_argbuf_dynmem}"
 BENCHMARK_CONFIG="${BENCHMARK_CONFIG:-$CHECKOUT/.github/ci/benchmark_config.json}"
 if ! PORTED_MODELS="$(python3 "$CHECKOUT/.github/ci/scripts/benchmark_config_helpers.py" --config "$BENCHMARK_CONFIG" --target sysemu --models all --format csv)"; then
   exit 2
@@ -134,7 +135,7 @@ job_dump=()
 
 common_loads() {
   local model="$1"
-  python3 - "$CHECKOUT" "$BENCHMARK_CONFIG" "$model" "$AMP" <<'PY'
+  python3 - "$CHECKOUT" "$BENCHMARK_CONFIG" "$model" "$ARTIFACTS" <<'PY'
 import sys
 
 repo, cfg_path, model, amp = sys.argv[1:5]
@@ -182,7 +183,7 @@ build_bench_suite() {
   [[ "$suite" == "smoke" || "$suite" == "full" ]] || die "unsupported bench suite: $suite"
   while IFS=$'\t' read -r model bench_dir manifest || [[ -n "${model:-}" ]]; do
     [[ -n "${model:-}" && -n "${bench_dir:-}" && -n "${manifest:-}" ]] || continue
-    read_variants "$suite" "$model" "$AMP/$bench_dir" "$manifest"
+    read_variants "$suite" "$model" "$ARTIFACTS/$bench_dir" "$manifest"
   done < <(
     python3 "$CHECKOUT/.github/ci/scripts/benchmark_config_helpers.py" \
       --config "$BENCHMARK_CONFIG" \
@@ -194,7 +195,7 @@ build_bench_suite() {
 
 build_focused_suite() {
   local suite="$1"
-  local root="$AMP/optimization-kb/$suite"
+  local root="$ARTIFACTS/optimization-kb/$suite"
   local manifest="$root/focused20_variants.tsv"
   local model variant
   [[ -f "$manifest" ]] || return
@@ -266,7 +267,7 @@ missing_reasons() {
   while IFS= read -r reason; do
     [[ -n "$reason" ]] && reasons+=("$reason")
   done < <(
-    python3 - "$CHECKOUT" "$BENCHMARK_CONFIG" "${job_model[$i]}" "$AMP" <<'PY'
+    python3 - "$CHECKOUT" "$BENCHMARK_CONFIG" "${job_model[$i]}" "$ARTIFACTS" <<'PY'
 import sys
 
 repo, cfg_path, model, amp = sys.argv[1:5]

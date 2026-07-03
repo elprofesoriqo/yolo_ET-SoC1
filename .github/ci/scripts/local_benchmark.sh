@@ -21,14 +21,14 @@ fi
 # Reuse an existing launcher when present (faster local iteration).
 if [[ -x "${LAUNCHER_OVERRIDE:-}" ]]; then
   export LAUNCHER="${LAUNCHER_OVERRIDE}"
-elif [[ -x "${HOME}/zephyr/local-artifacts/erbium_amp_probe/whisper-real/host-dynmem/build/erbium_soc1sim_argbuf_dynmem" ]]; then
-  export LAUNCHER="${HOME}/zephyr/local-artifacts/erbium_amp_probe/whisper-real/host-dynmem/build/erbium_soc1sim_argbuf_dynmem"
+elif [[ -x "${BUILD_ROOT}/erbium_soc1sim_argbuf/erbium_soc1sim_argbuf_dynmem" ]]; then
+  export LAUNCHER="${BUILD_ROOT}/erbium_soc1sim_argbuf/erbium_soc1sim_argbuf_dynmem"
 fi
 
 if [[ -n "${BENCHMARK_ASSETS_DIR:-}" ]]; then
   export BENCHMARK_ASSETS_DIR
-elif [[ -d "${HOME}/zephyr/local-artifacts/erbium_amp_probe" ]]; then
-  export BENCHMARK_ASSETS_DIR="${HOME}/zephyr/local-artifacts/erbium_amp_probe"
+elif [[ -d "${BENCHMARK_ARTIFACT_ROOT}" ]]; then
+  export BENCHMARK_ASSETS_DIR="${BENCHMARK_ARTIFACT_ROOT}"
 fi
 
 models=("$@")

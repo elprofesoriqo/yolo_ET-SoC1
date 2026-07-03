@@ -42,6 +42,7 @@ export CORE_ET_SRC="$WORK_ROOT/core-et"
 export ET_INSTALL="$WORK_ROOT/et"
 export BUILD_ROOT="$WORK_ROOT/build"
 export ARTIFACT_ROOT="$MODEL_PORT_REPO/local-artifacts"
+export BENCHMARK_ARTIFACT_ROOT="$ARTIFACT_ROOT/model-port-benchmarks"
 
 # Set this to the ET-SoC1 board host assigned to you.
 export BOARD_HOST="<your-et-soc1-board-host>"
@@ -103,10 +104,9 @@ export PATH="$ET_INSTALL/bin:$PATH"
 Verify:
 
 ```bash
+cd "$MODEL_PORT_REPO"
 riscv64-unknown-elf-gcc --version | head -1
-test -f "$ET_PLATFORM_SRC/et-common-libs/share/erbium-soc1sim/erbium.ld"
-test -d "$ET_PLATFORM_SRC/et-common-libs/include"
-test -d "$ET_PLATFORM_SRC/hal/platform/etsoc/include"
+.github/ci/scripts/resolve_et_platform_paths.sh
 ```
 
 ## Download Hugging Face References
@@ -126,22 +126,43 @@ way.
 
 ## Build The Argbuf Launcher
 
-The model-port runs use `erbium_soc1sim_argbuf`. Build it with the installed
-AIFoundry runtime:
+The model-port runs use `erbium_soc1sim_argbuf_dynmem`. Build the launcher from
+the checked-in source under `.github/ci/launcher`. Do not build it from
+`local-artifacts/`; that tree contains generated benchmark outputs and will not
+exist in a fresh clone.
 
 ```bash
 cd "$MODEL_PORT_REPO"
-mkdir -p "$BUILD_ROOT"
+export ET_PLATFORM="$ET_INSTALL"
 
-cmake -S "$ARTIFACT_ROOT/erbium_amp_probe/whisper-real/host-dynmem" \
-  -B "$BUILD_ROOT/erbium_soc1sim_argbuf" \
-  -DCMAKE_PREFIX_PATH="$ET_INSTALL" \
-  -DCMAKE_INSTALL_PREFIX="$ET_INSTALL"
-cmake --build "$BUILD_ROOT/erbium_soc1sim_argbuf" -j"$(nproc)"
+.github/ci/scripts/build_launcher.sh
 
 export LOCAL_ARGBUF="$BUILD_ROOT/erbium_soc1sim_argbuf/erbium_soc1sim_argbuf_dynmem"
-"$LOCAL_ARGBUF" --help | head
+test -x "$LOCAL_ARGBUF"
+"$LOCAL_ARGBUF" --help 2>&1 | head -3
 ```
+
+## Build Smoke Artifacts
+
+`$BENCHMARK_ARTIFACT_ROOT` is created by the benchmark build flow. Build the
+canonical smoke ELFs before running sys-emu or staging files to the board:
+
+```bash
+cd "$MODEL_PORT_REPO"
+
+.github/ci/scripts/prepare_benchmark_inputs.sh all
+.github/ci/scripts/build_leaderboard_elf.sh yolo
+.github/ci/scripts/build_leaderboard_elf.sh whisper
+.github/ci/scripts/build_leaderboard_elf.sh dncnn
+
+find "$BENCHMARK_ARTIFACT_ROOT" -maxdepth 2 -type f \
+  \( -name '*.elf' -o -name '*_variants.txt' -o -name 'zero2m.bin' \) \
+  | sort
+```
+
+The DnCNN ELF builds from checked-in source, but a DnCNN run also needs derived
+input and weight blobs under `$BENCHMARK_ARTIFACT_ROOT/dncnn3-bench`. If those
+blobs are not present yet, run YOLO and Whisper first.
 
 ## Local Sys-Emu Run
 
@@ -154,25 +175,30 @@ cd "$MODEL_PORT_REPO"
 scripts/run_sysemu_model_ports.sh \
   --launcher "$LOCAL_ARGBUF" \
   --suite smoke \
+  --model yolo,whisper \
+  --variant y10_00_base,w10_00_base \
   --list
 ```
 
-Run model-port smoke jobs:
+Run the canonical YOLO and Whisper smoke jobs:
 
 ```bash
 scripts/run_sysemu_model_ports.sh \
   --launcher "$LOCAL_ARGBUF" \
   --suite smoke \
+  --model yolo,whisper \
+  --variant y10_00_base,w10_00_base \
   --timeout 1800 \
   --launcher-timeout 1800
 ```
 
-Larger suites:
+Larger suites need their matching variant ELFs and manifests under
+`$BENCHMARK_ARTIFACT_ROOT`. Check what is ready before running them:
 
 ```bash
-scripts/run_sysemu_model_ports.sh --launcher "$LOCAL_ARGBUF" --suite focused20 --timeout 3600 --launcher-timeout 3600
-scripts/run_sysemu_model_ports.sh --launcher "$LOCAL_ARGBUF" --suite focused20b --timeout 3600 --launcher-timeout 3600
-scripts/run_sysemu_model_ports.sh --launcher "$LOCAL_ARGBUF" --suite full --timeout 3600 --launcher-timeout 3600
+scripts/run_sysemu_model_ports.sh --launcher "$LOCAL_ARGBUF" --suite focused20 --model yolo,whisper --list
+scripts/run_sysemu_model_ports.sh --launcher "$LOCAL_ARGBUF" --suite focused20b --model yolo,whisper --list
+scripts/run_sysemu_model_ports.sh --launcher "$LOCAL_ARGBUF" --suite full --model yolo,whisper --list
 ```
 
 Sys-emu can be much slower than the board for the larger hand-C kernels.
@@ -206,24 +232,44 @@ ssh "$BOARD_SSH" "
 
 ## Stage A Smoke Suite
 
+These examples assume the smoke artifacts above exist under
+`$BENCHMARK_ARTIFACT_ROOT`.
+
+Common input used by YOLO, Whisper, and DnCNN:
+
+```bash
+ssh "$BOARD_SSH" "mkdir -p '$REMOTE_MODELS'"
+rsync -aq \
+  "$BENCHMARK_ARTIFACT_ROOT/zero2m.bin" \
+  "$BOARD_SSH:$REMOTE_MODELS/"
+```
+
 YOLO example:
 
 ```bash
 ssh "$BOARD_SSH" "mkdir -p '$REMOTE_MODELS/yolo-bench'"
 rsync -aq \
-  "$ARTIFACT_ROOT/erbium_amp_probe/yolo-bench"/y10_*.elf \
-  "$ARTIFACT_ROOT/erbium_amp_probe/yolo-bench/yolo_10_variants.txt" \
+  "$BENCHMARK_ARTIFACT_ROOT/yolo-bench"/y10_*.elf \
+  "$BENCHMARK_ARTIFACT_ROOT/yolo-bench/yolo_10_variants.txt" \
   "$BOARD_SSH:$REMOTE_MODELS/yolo-bench/"
 ```
 
 DnCNN example:
 
 ```bash
+test -f "$BENCHMARK_ARTIFACT_ROOT/dncnn3-bench/dncnn3_input.bin"
+test -f "$BENCHMARK_ARTIFACT_ROOT/dncnn3-bench/dncnn3_weights.bin"
+
 ssh "$BOARD_SSH" "mkdir -p '$REMOTE_MODELS/dncnn3-pmc'"
 rsync -aq \
-  "$ARTIFACT_ROOT/erbium_amp_probe/dncnn3-pmc"/v3x_*.elf \
-  "$ARTIFACT_ROOT/erbium_amp_probe/dncnn3-pmc/v3x_variants.txt" \
+  "$BENCHMARK_ARTIFACT_ROOT/dncnn3-pmc"/v3x_*.elf \
+  "$BENCHMARK_ARTIFACT_ROOT/dncnn3-pmc/v3x_variants.txt" \
   "$BOARD_SSH:$REMOTE_MODELS/dncnn3-pmc/"
+
+rsync -aq \
+  "$BENCHMARK_ARTIFACT_ROOT/dncnn3-bench/dncnn3_input.bin" \
+  "$BENCHMARK_ARTIFACT_ROOT/dncnn3-bench/dncnn3_weights.bin" \
+  "$BOARD_SSH:$REMOTE_MODELS/"
 ```
 
 Use the same pattern for `whisper-bench`: stage the `*10*.elf` files and the
@@ -324,7 +370,7 @@ using them or build with explicit variables like this:
 ```bash
 GCC="$ET_INSTALL/bin/riscv64-unknown-elf-gcc"
 INC="$ET_PLATFORM_SRC"
-ROOT="$ARTIFACT_ROOT/erbium_amp_probe"
+ROOT="$BENCHMARK_ARTIFACT_ROOT"
 
 "$GCC" \
   -O2 -nostdlib \

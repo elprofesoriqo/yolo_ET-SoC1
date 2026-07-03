@@ -11,7 +11,11 @@ export REPO_ROOT
 export WORK_ROOT="${WORK_ROOT:-${REPO_ROOT}/.ci-work}"
 export ET_PLATFORM_SRC="${ET_PLATFORM_SRC:-${WORK_ROOT}/et-platform}"
 export ET_INSTALL="${ET_INSTALL:-${WORK_ROOT}/et}"
-export AMP_ROOT="${AMP_ROOT:-${REPO_ROOT}/local-artifacts/erbium_amp_probe}"
+if [[ -n "${AMP_ROOT:-}" && -z "${BENCHMARK_ARTIFACT_ROOT:-}" ]]; then
+  BENCHMARK_ARTIFACT_ROOT="${AMP_ROOT}"
+fi
+export BENCHMARK_ARTIFACT_ROOT="${BENCHMARK_ARTIFACT_ROOT:-${REPO_ROOT}/local-artifacts/model-port-benchmarks}"
+export AMP_ROOT="${AMP_ROOT:-${BENCHMARK_ARTIFACT_ROOT}}"
 export BUILD_ROOT="${BUILD_ROOT:-${WORK_ROOT}/build}"
 export BENCHMARK_OUTPUT="${BENCHMARK_OUTPUT:-${WORK_ROOT}/benchmark-output}"
 export BENCHMARK_CONFIG="${BENCHMARK_CONFIG:-${REPO_ROOT}/.github/ci/benchmark_config.json}"

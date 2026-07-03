@@ -33,4 +33,4 @@ if [[ ! -x "${LAUNCHER}" ]]; then
   exit 1
 fi
 
-"${LAUNCHER}" --help | head -3
+"${LAUNCHER}" --help 2>&1 | head -3

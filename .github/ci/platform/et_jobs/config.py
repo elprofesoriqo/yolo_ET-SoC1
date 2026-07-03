@@ -22,6 +22,13 @@ API_BIND = os.environ.get("JOBS_BIND", "127.0.0.1:8080")
 API_URL = os.environ.get("JOBS_API_URL", f"http://{API_BIND}")
 HOST_ID = os.environ.get("HOST_ID", "localhost")
 REPO_ROOT = _path("JOBS_REPO_ROOT", str(Path(__file__).resolve().parents[4]))
+MODEL_PORT_ARTIFACTS = _path(
+    "BENCHMARK_ARTIFACT_ROOT",
+    os.environ.get(
+        "AMP_ROOT",
+        str(REPO_ROOT / "local-artifacts" / "model-port-benchmarks"),
+    ),
+)
 BENCHMARK_CONFIG = _path(
     "BENCHMARK_CONFIG",
     str(REPO_ROOT / ".github" / "ci" / "benchmark_config.json"),

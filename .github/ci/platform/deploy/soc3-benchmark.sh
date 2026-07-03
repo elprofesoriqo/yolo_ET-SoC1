@@ -10,6 +10,7 @@ set -euo pipefail
 
 DEST="${SOC3_DEST:-/root/et-jobs-deploy}"
 ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+BENCHMARK_ARTIFACT_ROOT="${BENCHMARK_ARTIFACT_ROOT:-${ROOT}/local-artifacts/model-port-benchmarks}"
 MODELS="${MODELS:-}"
 MODELS="$(python3 "${ROOT}/.github/ci/scripts/benchmark_config_helpers.py" --target board --models "$MODELS" --format space)"
 # shellcheck source=soc3-ssh.sh
@@ -19,7 +20,7 @@ export SOC3_HOST
 
 if [[ -x "${SOC3_BUILD_ET:-$HOME/et}/bin/riscv64-unknown-elf-gcc" ]]; then
   echo "==> Pre-building ELFs locally (${SOC3_BUILD_ET:-$HOME/et})"
-  mkdir -p "${ROOT}/local-artifacts/erbium_amp_probe"
+  mkdir -p "${BENCHMARK_ARTIFACT_ROOT}"
   _etp="${ET_PLATFORM_SRC:-${ROOT}/.ci-work/et-platform}"
   ELF_MODELS="$(python3 - "$ROOT" "$MODELS" <<'PY'
 import sys
@@ -34,7 +35,7 @@ PY
   for _m in ${ELF_MODELS}; do
     REPO_ROOT="${ROOT}" BOARD_BENCHMARK=1 BENCHMARK_DEVICE=soc1sim \
       ET_INSTALL="${SOC3_BUILD_ET:-$HOME/et}" ET_PLATFORM_SRC="${_etp}" \
-      AMP_ROOT="${ROOT}/local-artifacts/erbium_amp_probe" \
+      BENCHMARK_ARTIFACT_ROOT="${BENCHMARK_ARTIFACT_ROOT}" \
       bash "${ROOT}/.github/ci/scripts/build_leaderboard_elf.sh" "${_m}"
   done
   export SOC3_PREBUILT=1
@@ -59,14 +60,14 @@ echo "==> Syncing repo to ${RSYNC_HOST}${DEST}"
 if [[ "${SOC3_PREBUILT:-}" == "1" ]]; then
   echo "==> Syncing prebuilt ELFs"
   if [[ "$TRANSPORT" == "local" ]]; then
-    mkdir -p "${DEST}/local-artifacts/erbium_amp_probe"
+    mkdir -p "${DEST}/local-artifacts/model-port-benchmarks"
     rsync -az \
-      "${ROOT}/local-artifacts/erbium_amp_probe/" \
-      "${DEST}/local-artifacts/erbium_amp_probe/"
+      "${BENCHMARK_ARTIFACT_ROOT}/" \
+      "${DEST}/local-artifacts/model-port-benchmarks/"
   else
     rsync -az -e "$(soc3_rsync_rsh)" \
-      "${ROOT}/local-artifacts/erbium_amp_probe/" \
-      "${RSYNC_HOST%/}:${DEST}/local-artifacts/erbium_amp_probe/"
+      "${BENCHMARK_ARTIFACT_ROOT}/" \
+      "${RSYNC_HOST%/}:${DEST}/local-artifacts/model-port-benchmarks/"
   fi
 fi
 
@@ -171,7 +172,8 @@ export BOARD_LOCK="${BOARD_LOCK:-/var/lock/etsoc-shire0.lock}"
 export SOC3_PREBUILT="${SOC3_PREBUILT:-0}"
 export WORK_ROOT="$DEST/.ci-work"
 export BENCHMARK_OUTPUT="$DEST/benchmark-output"
-export AMP_ROOT="$DEST/local-artifacts/erbium_amp_probe"
+export BENCHMARK_ARTIFACT_ROOT="$DEST/local-artifacts/model-port-benchmarks"
+export AMP_ROOT="$BENCHMARK_ARTIFACT_ROOT"
 if [[ -z "${LAUNCHER:-}" ]]; then
   if [[ -x "${ET_INSTALL}/bin/erbium_soc1sim_argbuf_dynmem" ]]; then
     export LAUNCHER="${ET_INSTALL}/bin/erbium_soc1sim_argbuf_dynmem"
