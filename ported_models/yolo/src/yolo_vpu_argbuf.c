@@ -169,6 +169,16 @@ static inline int bench_hart_enabled(uint32_t hart_id)
 #endif
 }
 
+static inline int bench_hart_is_thread0(uint32_t hart_id)
+{
+#ifdef BENCH_THREAD0_ONLY
+	(void)hart_id;
+	return 1;
+#else
+	return (hart_id & 1u) == 0u;
+#endif
+}
+
 static inline void bench_barrier(void)
 {
 	if (ACTIVE_HARTS > 1u) {
@@ -971,9 +981,13 @@ int main(uintptr_t arg_area)
 			evict_activation_read_float(src, row0, row1);
 			WAIT_CACHEOPS;
 			#ifdef YOLO_TFMA_INT8
-			conv1x1_tfma_int8(base, src, block, dst, row0, row1);
-			if (hart_id == 0u && pass == 0u && block == 0u) {
-				tfma_error = (uint32_t)get_tensor_error();
+			if (bench_hart_is_thread0(hart_id)) {
+				conv1x1_tfma_int8(base, src, block, dst, row0, row1);
+				if (hart_id == 0u && pass == 0u && block == 0u) {
+					tfma_error = (uint32_t)get_tensor_error();
+				}
+			} else {
+				conv1x1_fp(src, conv1_w, dst, row0, row1);
 			}
 			#else
 			conv1x1_fp(src, conv1_w, dst, row0, row1);
