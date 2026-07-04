@@ -57,9 +57,14 @@ extern char heap0_end[];
 #define ACT1_OFFSET       0xF0000u
 #define OUTPUT_OFFSET     0x160000u
 
-#define WINT8_OFFSET   0x180000u   // INT8 weights: YOLO_BLOCKS * CH * 64B
-#define WSCALE_OFFSET  0x182000u   // FP32: YOLO_BLOCKS * CH floats
-#define AINT8_OFFSET   0x190000u   // INT8 activations: IMG_W*IMG_H * 64B
+// TFMA INT8 Layouts
+#define W3_INT8_OFFSET   0x180000u // W3 layout: [BLOCK][9][CH][64]
+#define W3_SCALE_OFFSET  0x1DD000u
+
+#define W1_INT8_OFFSET   0x1DE000u // W1 layout: [BLOCK][CH][64]
+#define W1_SCALE_OFFSET  0x1E9000u
+
+#define AINT8_OFFSET     0x1EA000u // INT8 activations: IMG_W*IMG_H * 64B
 
 #define BENCH_FLB         2u
 #define BENCH_FCC         FCC_0
@@ -98,7 +103,11 @@ struct yolo_summary {
 struct bench_barrier_state {
 	uint32_t count;
 	uint32_t epoch;
-	uint32_t reserved[14];
+	uint32_t next_row_inval;
+	uint32_t next_row_max;
+	uint32_t next_row_quant;
+	uint32_t next_row_conv;
+	uint32_t reserved[10];
 };
 
 static volatile struct bench_barrier_state *g_barrier;
@@ -791,121 +800,172 @@ static int8_t clamp_i8(float v)
     return (int8_t)i;
 }
 
-static void quantize_conv1_w(uint8_t *base, const float *weights)
+static void quantize_weights(uint8_t *base, const float *weights)
 {
-    int8_t *const wint8 = (int8_t *)(base + WINT8_OFFSET);
-    float *const wscale = (float *)(base + WSCALE_OFFSET);
+    int8_t *const w3_int8 = (int8_t *)(base + W3_INT8_OFFSET);
+    float *const w3_scale = (float *)(base + W3_SCALE_OFFSET);
+    int8_t *const w1_int8 = (int8_t *)(base + W1_INT8_OFFSET);
+    float *const w1_scale = (float *)(base + W1_SCALE_OFFSET);
 
     for (uint32_t b = 0; b < YOLO_BLOCKS; ++b) {
-        const float *const w = weights + b * BLOCK_WEIGHTS + CONV3_WEIGHTS;
-
+        const float *const w3 = weights + b * BLOCK_WEIGHTS;
         for (uint32_t oc = 0; oc < CH; ++oc) {
             float mx = 0.0f;
+            for (uint32_t k = 0; k < 9; ++k) {
+                for (uint32_t ic = 0; ic < CH; ++ic) {
+                    float a = w3[oc * 9 * CH + k * CH + ic];
+                    if (a < 0.0f) a = -a;
+                    if (a > mx) mx = a;
+                }
+            }
+            float scale = mx == 0.0f ? 1.0f : mx / 127.0f;
+            w3_scale[b * CH + oc] = scale;
+            const float inv = 1.0f / scale;
 
+            for (uint32_t k = 0; k < 9; ++k) {
+                int8_t *const d = w3_int8 + (((b * 9) + k) * CH + oc) * 64u;
+                for (uint32_t ic = 0; ic < CH; ++ic)
+                    d[ic] = clamp_i8(w3[oc * 9 * CH + k * CH + ic] * inv);
+                for (uint32_t ic = CH; ic < 64u; ++ic) d[ic] = 0;
+            }
+        }
+
+        const float *const w1 = weights + b * BLOCK_WEIGHTS + CONV3_WEIGHTS;
+        for (uint32_t oc = 0; oc < CH; ++oc) {
+            float mx = 0.0f;
             for (uint32_t ic = 0; ic < CH; ++ic) {
-                float a = w[oc * CH + ic];
+                float a = w1[oc * CH + ic];
                 if (a < 0.0f) a = -a;
                 if (a > mx) mx = a;
             }
-
             float scale = mx == 0.0f ? 1.0f : mx / 127.0f;
-            wscale[b * CH + oc] = scale;
-
+            w1_scale[b * CH + oc] = scale;
             const float inv = 1.0f / scale;
-            int8_t *const d = wint8 + (b * CH + oc) * 64u;
 
-            for (uint32_t ic = 0; ic < CH; ++ic) {
-                d[ic] = clamp_i8(w[oc * CH + ic] * inv);
-            }
-
-            for (uint32_t ic = CH; ic < 64u; ++ic) {
-                d[ic] = 0;
-            }
+            int8_t *const d = w1_int8 + (b * CH + oc) * 64u;
+            for (uint32_t ic = 0; ic < CH; ++ic)
+                d[ic] = clamp_i8(w1[oc * CH + ic] * inv);
+            for (uint32_t ic = CH; ic < 64u; ++ic) d[ic] = 0;
         }
     }
 }
-static float quantize_act_stripe(const float *src, int8_t *aint8, uint32_t p0, uint32_t p1)
+
+static void conv3x3_fused_tfma_row(uint8_t *base, const float *src,
+				    const int8_t *aint8, uint32_t block,
+				    float *output, uint32_t y, float act_scale)
 {
-float mx = 0.0f;
+	const int8_t *const w3_int8 = (const int8_t *)(base + W3_INT8_OFFSET) + block * 9 * CH * 64u;
+	const float *const w3_scale = (const float *)(base + W3_SCALE_OFFSET) + block * CH;
+	const float *const w3_fp = (const float *)(base + WEIGHTS_OFFSET) + block * BLOCK_WEIGHTS;
+	const int8_t *const w1_int8 = (const int8_t *)(base + W1_INT8_OFFSET) + block * CH * 64u;
+	const float *const w1_scale = (const float *)(base + W1_SCALE_OFFSET) + block * CH;
 
-    for (uint32_t p = p0; p < p1; ++p) {
-        for (uint32_t c = 0; c < CH; c++) {
-            float val = src[p * CH + c];
-            float a = val;
-            if (a < 0.0f) a = -a;
-            if (a > mx) mx = a;
-        }
-    }
+	__attribute__((aligned(64))) float row_conv3_out[IMG_W * CH];
 
-    float scale = mx == 0.0f ? 1.0f : mx / 127.0f;
-    const float inv = 1.0f / scale;
+	for (uint32_t x = 0; x < IMG_W; ) {
+		if (y == 0 || y == IMG_H - 1u || x == 0 || x == IMG_W - 1u) {
+			for (uint32_t oc = 0; oc < CH; oc++) {
+				float v = conv3_scalar(src, w3_fp + oc * 9 * CH, y, x);
+				row_conv3_out[x * CH + oc] = relu6_f32(v * CONV3_SCALE);
+			}
+			x++;
+		} else {
+			uint32_t npix = (x + 16u <= IMG_W - 1u) ? 16u : (IMG_W - 1u - x);
+			__attribute__((aligned(64))) int32_t tenc_buffer[16 * CH];
 
-    for (uint32_t p = p0; p < p1; ++p) {
-        int8_t *const d = aint8 + p * 64u;
+			for (int ky = -1; ky <= 1; ky++) {
+				for (int kx = -1; kx <= 1; kx++) {
+					int k = (ky + 1) * 3 + (kx + 1);
+					tensor_load(false, false, 0, 0, 1,
+						    (uint64_t)(w3_int8 + k * CH * 64u),
+						    0, CH - 1u, 64u, 1);
+					tensor_wait(TENSOR_LOAD_WAIT_1);
 
-        for (uint32_t c = 0; c < CH; ++c) {
-            d[c] = clamp_i8(src[p * CH + c] * inv);
-        }
-        
-        for (uint32_t c = CH; c < 64u; ++c) {
-            d[c] = 0;
-        }
-    }
-    
-    return scale;
-}
+					uint32_t p_start = (y + ky) * IMG_W + (x + kx);
+					tensor_load(false, false, 0, 0, 0,
+						    (uint64_t)(aint8 + p_start * 64u),
+						    0, npix - 1u, 64u, 0);
+					tensor_wait(TENSOR_LOAD_WAIT_0);
 
-static void conv1x1_tfma_int8(uint8_t *base, const float *src, uint32_t block, float *output, uint32_t row0, uint32_t row1)
-{
-	int8_t *const aint8 = (int8_t *)(base + AINT8_OFFSET);
-	const int8_t *const wint8 = (const int8_t *)(base + WINT8_OFFSET)+ block * CH * 64u;
-	const float *const wscale = (const float *)(base + WSCALE_OFFSET)+ block * CH;
-	const uint32_t p0 = row0 * IMG_W;
-	const uint32_t p1 = row1 * IMG_W;
+					bool first_pass = (k == 0);
+					tensor_fma(false, (CH / 4u) - 1u, npix - 1u,
+						   (CH / 4u) - 1u, 0,
+						   (k == 8), false, false, true,
+						   0, 0, 3, first_pass);
+					tensor_wait(TENSOR_FMA_WAIT);
+				}
+			}
 
-	const float act_scale = quantize_act_stripe(src, aint8, p0, p1);
+			tensor_store(0, 0, (CH / 4u) - 1u, npix - 1u,
+				     (uint64_t)tenc_buffer, 0, 64u);
+			tensor_wait(TENSOR_STORE_WAIT);
+
+			for (uint32_t i = 0; i < npix; i++) {
+				for (uint32_t c = 0; c < CH; c++) {
+					float v = (float)tenc_buffer[i * CH + c]
+						  * act_scale * w3_scale[c] * CONV3_SCALE;
+					row_conv3_out[(x + i) * CH + c] = relu6_f32(v);
+				}
+			}
+			x += npix;
+		}
+	}
+
+	__attribute__((aligned(64))) int8_t row_conv3_int8[IMG_W * 64];
+	float mx1 = 0.0f;
+	for (uint32_t x = 0; x < IMG_W; ++x) {
+		for (uint32_t c = 0; c < CH; c++) {
+			float a = row_conv3_out[x * CH + c];
+			if (a < 0.0f) a = -a;
+			if (a > mx1) mx1 = a;
+		}
+	}
+	float scale1 = mx1 == 0.0f ? 1.0f : mx1 / 127.0f;
+	const float inv1 = 1.0f / scale1;
+	for (uint32_t x = 0; x < IMG_W; ++x) {
+		int8_t *const d = row_conv3_int8 + x * 64u;
+		for (uint32_t c = 0; c < CH; ++c)
+			d[c] = clamp_i8(row_conv3_out[x * CH + c] * inv1);
+		for (uint32_t c = CH; c < 64u; ++c) d[c] = 0;
+	}
+
 	FENCE;
-	evict(aint8 + p0 * 64u, (p1 - p0) * 64u);
-    WAIT_CACHEOPS;
+	evict(row_conv3_int8, IMG_W * 64u);
+	WAIT_CACHEOPS;
 
-    tensor_load(false, false, 0, 0, 1, (uint64_t)wint8, 0, CH - 1u, 64u, 1);
-    tensor_wait(TENSOR_LOAD_WAIT_1);
+	tensor_load(false, false, 0, 0, 1,
+		    (uint64_t)w1_int8, 0, CH - 1u, 64u, 1);
+	tensor_wait(TENSOR_LOAD_WAIT_1);
 
-    for (uint32_t p = p0; p < p1; p += 16u) {
-        const uint32_t npix = (p + 16u <= p1) ? 16u : (p1 - p);
-        tensor_load(false, false, 0, 0, 0, (uint64_t)(aint8 + p * 64u), 0, npix - 1u, 64u, 0);
-        tensor_wait(TENSOR_LOAD_WAIT_0);
-        tensor_fma(false,            // use_tmask 
-                   (CH / 4u) - 1u,   // b_num_col: 16 output channels
-                   npix - 1u,        // a_num_rows
-                   (CH / 4u) - 1u,   // a_num_cols: contract 16 input channels
-                   0,                // offset 
-                   true,             // tenc_loc: copy TenC -> FREGs for store
-                   false, false,     // signed weights, signed activations
-                   true,             // tenb_loc: B from TenB
-                   0, 0,             // scp_loc_b (ignored), scp_loc_a = line 0
-                   3,                // opcode: INT8
-                   true);            // first_pass: zero the accumulator
-        tensor_wait(TENSOR_FMA_WAIT);
+	for (uint32_t x = 0; x < IMG_W; x += 16u) {
+		uint32_t npix = (x + 16u <= IMG_W) ? 16u : (IMG_W - x);
+		tensor_load(false, false, 0, 0, 0,
+			    (uint64_t)(row_conv3_int8 + x * 64u),
+			    0, npix - 1u, 64u, 0);
+		tensor_wait(TENSOR_LOAD_WAIT_0);
 
-        tensor_store(0, 0, (CH / 4u) - 1u, npix - 1u, (uint64_t)((uint8_t *)output + p * 64u), 0, 64u);
-        tensor_wait(TENSOR_STORE_WAIT);
-    }
+		tensor_fma(false, (CH / 4u) - 1u, npix - 1u,
+			   (CH / 4u) - 1u, 0,
+			   true, false, false, true, 0, 0, 3, true);
+		tensor_wait(TENSOR_FMA_WAIT);
 
-    FENCE;
-    evict(output + p0 * CH, (p1 - p0) * CH * sizeof(float));
-    WAIT_CACHEOPS;
+		__attribute__((aligned(64))) int32_t tenc_buffer[16 * CH];
+		tensor_store(0, 0, (CH / 4u) - 1u, npix - 1u,
+			     (uint64_t)tenc_buffer, 0, 64u);
+		tensor_wait(TENSOR_STORE_WAIT);
 
-    for (uint32_t p = p0; p < p1; p++)
-        for (uint32_t c = 0; c < CH; c++) {
-            int32_t raw;
-            __builtin_memcpy(&raw, &output[p * CH + c], sizeof(int32_t));
-            float v = (float)raw * act_scale * wscale[c] * CONV1_SCALE;
-            output[p * CH + c] = relu6_f32(v);
-        }
-    FENCE;
-    evict(output + p0 * CH, (p1 - p0) * CH * sizeof(float));
-    WAIT_CACHEOPS;
+		for (uint32_t i = 0; i < npix; i++) {
+			for (uint32_t c = 0; c < CH; c++) {
+				float v = (float)tenc_buffer[i * CH + c]
+					  * scale1 * w1_scale[c] * CONV1_SCALE;
+				output[(y * IMG_W + x + i) * CH + c] = relu6_f32(v);
+			}
+		}
+	}
+
+	FENCE;
+	evict(output + y * IMG_W * CH, IMG_W * CH * sizeof(float));
+	WAIT_CACHEOPS;
 }
 #endif
 
@@ -913,9 +973,7 @@ int main(uintptr_t arg_area)
 {
 	const uint32_t hart_id = bench_hart_id();
 
-	if (!bench_hart_enabled(hart_id)) {
-		return 0;
-	}
+	if (!bench_hart_enabled(hart_id)) return 0;
 
 	uint8_t *const base = (uint8_t *)buffer_base_from_args(arg_area);
 	float *const input = (float *)(base + INPUT_OFFSET);
@@ -932,15 +990,11 @@ int main(uintptr_t arg_area)
 	const uint32_t row0 = (IMG_H * hart_id) / ACTIVE_HARTS;
 	const uint32_t row1 = (IMG_H * (hart_id + 1u)) / ACTIVE_HARTS;
 
-	#ifdef YOLO_TFMA_INT8
-	uint32_t tfma_error = 0;
-	#endif
-
 	if (hart_id == 0u) {
 		init_model(input, weights);
 		
 		#ifdef YOLO_TFMA_INT8
-		quantize_conv1_w(base, weights);
+		quantize_weights(base, weights);
 		#endif
 
 		FENCE;
@@ -948,8 +1002,10 @@ int main(uintptr_t arg_area)
 		evict(weights, WEIGHT_BYTES);
 
 		#ifdef YOLO_TFMA_INT8
-		evict(base + WINT8_OFFSET, YOLO_BLOCKS * CH * 64u);
-		evict(base + WSCALE_OFFSET, YOLO_BLOCKS * CH * sizeof(float));
+		evict(base + W3_INT8_OFFSET, YOLO_BLOCKS * 9 * CH * 64u);
+		evict(base + W3_SCALE_OFFSET, YOLO_BLOCKS * CH * sizeof(float));
+		evict(base + W1_INT8_OFFSET, YOLO_BLOCKS * CH * 64u);
+		evict(base + W1_SCALE_OFFSET, YOLO_BLOCKS * CH * sizeof(float));
 		#endif
 		WAIT_CACHEOPS;
 	}
@@ -962,11 +1018,95 @@ int main(uintptr_t arg_area)
 		float *dst = act0;
 
 		for (uint32_t block = 0; block < YOLO_BLOCKS; block++) {
-			const float *const block_w =
-				weights + block * BLOCK_WEIGHTS;
+			const float *const block_w = weights + block * BLOCK_WEIGHTS;
 			const float *const conv3_w = block_w;
 			const float *const conv1_w = block_w + CONV3_WEIGHTS;
 
+			#ifdef YOLO_TFMA_INT8
+			if (hart_id == 0u) {
+				g_barrier->next_row_inval = 0u;
+				g_barrier->next_row_max   = 0u;
+				g_barrier->next_row_quant = 0u;
+				g_barrier->next_row_conv  = 0u;
+			}
+			bench_barrier();
+
+			if (bench_hart_is_thread0(hart_id)) {
+				while (1) {
+					uint32_t y = __atomic_fetch_add(
+						&g_barrier->next_row_inval, 1u,
+						__ATOMIC_RELAXED);
+					if (y >= IMG_H) break;
+					evict((const void *)(src + y * IMG_W * CH),
+					      IMG_W * CH * sizeof(float));
+				}
+				WAIT_CACHEOPS;
+			}
+			bench_barrier();
+
+			if (bench_hart_is_thread0(hart_id)) {
+				float local_max = 0.0f;
+				while (1) {
+					uint32_t y = __atomic_fetch_add(
+						&g_barrier->next_row_max, 1u,
+						__ATOMIC_RELAXED);
+					if (y >= IMG_H) break;
+					for (uint32_t x = 0; x < IMG_W; x++) {
+						for (uint32_t c = 0; c < CH; c++) {
+							float a = src[(y * IMG_W + x) * CH + c];
+							if (a < 0.0f) a = -a;
+							if (a > local_max) local_max = a;
+						}
+					}
+				}
+				uint32_t raw_max;
+				__builtin_memcpy(&raw_max, &local_max, sizeof(raw_max));
+				g_barrier->reserved[hart_id / 2u] = raw_max;
+			}
+			bench_barrier();
+
+			float global_max = 0.0f;
+			for (uint32_t i = 0; i < ACTIVE_HARTS / 2u; i++) {
+				uint32_t raw_max = g_barrier->reserved[i];
+				float m;
+				__builtin_memcpy(&m, &raw_max, sizeof(m));
+				if (m > global_max) global_max = m;
+			}
+			const float act_scale = global_max == 0.0f ? 1.0f : global_max / 127.0f;
+			const float inv = 1.0f / act_scale;
+
+			if (bench_hart_is_thread0(hart_id)) {
+				int8_t *const aint8 = (int8_t *)(base + AINT8_OFFSET);
+				while (1) {
+					uint32_t y = __atomic_fetch_add(
+						&g_barrier->next_row_quant, 1u,
+						__ATOMIC_RELAXED);
+					if (y >= IMG_H) break;
+					for (uint32_t x = 0; x < IMG_W; ++x) {
+						int8_t *const d = aint8 + (y * IMG_W + x) * 64u;
+						for (uint32_t c = 0; c < CH; ++c)
+							d[c] = clamp_i8(src[(y * IMG_W + x) * CH + c] * inv);
+						for (uint32_t c = CH; c < 64u; ++c) d[c] = 0;
+					}
+					evict(aint8 + y * IMG_W * 64u, IMG_W * 64u);
+				}
+				WAIT_CACHEOPS;
+			}
+			bench_barrier();
+
+			if (bench_hart_is_thread0(hart_id)) {
+				const int8_t *const aint8 = (const int8_t *)(base + AINT8_OFFSET);
+				while (1) {
+					uint32_t y = __atomic_fetch_add(
+						&g_barrier->next_row_conv, 1u,
+						__ATOMIC_RELAXED);
+					if (y >= IMG_H) break;
+					conv3x3_fused_tfma_row(base, src, aint8,
+							       block, dst, y, act_scale);
+				}
+			}
+			bench_barrier();
+			#else
 			evict_activation_read_float(src, row0, row1);
 			WAIT_CACHEOPS;
 			conv3x3_fp(src, conv3_w, dst, row0, row1);
@@ -980,29 +1120,54 @@ int main(uintptr_t arg_area)
 
 			evict_activation_read_float(src, row0, row1);
 			WAIT_CACHEOPS;
-			#ifdef YOLO_TFMA_INT8
-			if (bench_hart_is_thread0(hart_id)) {
-				conv1x1_tfma_int8(base, src, block, dst, row0, row1);
-				if (hart_id == 0u && pass == 0u && block == 0u) {
-					tfma_error = (uint32_t)get_tensor_error();
-				}
-			} else {
-				conv1x1_fp(src, conv1_w, dst, row0, row1);
-			}
-			#else
 			conv1x1_fp(src, conv1_w, dst, row0, row1);
-			#endif
 			FENCE;
 			evict_activation_write_float(dst, row0, row1);
 			WAIT_CACHEOPS;
 			bench_barrier();
+			#endif
 
 			src = dst;
 			dst = (dst == act0) ? act1 : act0;
 		}
 
-		const float *const head_w =
-			weights + YOLO_BLOCKS * BLOCK_WEIGHTS;
+		const float *const head_w = weights + YOLO_BLOCKS * BLOCK_WEIGHTS;
+
+		#ifdef YOLO_TFMA_INT8
+		if (hart_id == 0u) g_barrier->next_row_inval = 0u;
+		bench_barrier();
+
+		if (bench_hart_is_thread0(hart_id)) {
+			while (1) {
+				uint32_t y = __atomic_fetch_add(
+					&g_barrier->next_row_inval, 1u,
+					__ATOMIC_RELAXED);
+				if (y >= IMG_H) break;
+				evict((const void *)(src + y * IMG_W * CH),
+				      IMG_W * CH * sizeof(float));
+			}
+			WAIT_CACHEOPS;
+		}
+		bench_barrier();
+
+		if (hart_id == 0u) g_barrier->next_row_conv = 0u;
+		bench_barrier();
+
+		if (bench_hart_is_thread0(hart_id)) {
+			while (1) {
+				uint32_t y = __atomic_fetch_add(
+					&g_barrier->next_row_conv, 1u,
+					__ATOMIC_RELAXED);
+				if (y >= IMG_H) break;
+				head1x1_fp(src, head_w, final_output, y, y + 1u);
+				FENCE;
+				evict(final_output + y * IMG_W * HEAD_CH,
+				      IMG_W * HEAD_CH);
+				WAIT_CACHEOPS;
+			}
+		}
+		bench_barrier();
+		#else
 		head1x1_fp(src, head_w, final_output, row0, row1);
 		FENCE;
 #ifdef YOLO_EVICT_OUTPUT_LAST_ONLY
@@ -1016,6 +1181,7 @@ int main(uintptr_t arg_area)
 #ifndef YOLO_SKIP_FINAL_BARRIER
 		bench_barrier();
 #endif
+		#endif
 	}
 
 	const uint32_t checksum = stripe_checksum(final_output, row0, row1);
@@ -1077,9 +1243,6 @@ int main(uintptr_t arg_area)
 		summary->ops_lo = (uint32_t)ops;
 		summary->ops_hi = (uint32_t)(ops >> 32);
 		summary->head_channels = HEAD_CH;
-		#ifdef YOLO_TFMA_INT8
-		summary->reserved[0] = tfma_error;
-		#endif
 
 		FENCE;
 		evict(final_output, OUT_BYTES);
