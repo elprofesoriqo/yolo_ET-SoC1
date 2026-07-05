@@ -850,122 +850,240 @@ static void quantize_weights(uint8_t *base, const float *weights)
     }
 }
 
-static void conv3x3_fused_tfma_row(uint8_t *base, const float *src,
-				    const int8_t *aint8, uint32_t block,
-				    float *output, uint32_t y, float act_scale)
+static void conv3x3_tfma_t0(
+	const int8_t *aint8, const int8_t *w3_int8,
+	float *dst, uint32_t y)
 {
-	const int8_t *const w3_int8 = (const int8_t *)(base + W3_INT8_OFFSET) + block * 9 * CH * 64u;
-	const float *const w3_scale = (const float *)(base + W3_SCALE_OFFSET) + block * CH;
-	const float *const w3_fp = (const float *)(base + WEIGHTS_OFFSET) + block * BLOCK_WEIGHTS;
-	const int8_t *const w1_int8 = (const int8_t *)(base + W1_INT8_OFFSET) + block * CH * 64u;
-	const float *const w1_scale = (const float *)(base + W1_SCALE_OFFSET) + block * CH;
+	const uint32_t MAX_NPIX = 14u;
+	const uint32_t total_pix = IMG_W - 2u;
+	const uint32_t SUPER_TILE = 56u;
 
-	__attribute__((aligned(64))) float row_conv3_out[IMG_W * CH];
+	for (uint32_t st_start = 1u; st_start <= total_pix; st_start += SUPER_TILE) {
+		uint32_t st_end = st_start + SUPER_TILE <= total_pix ? st_start + SUPER_TILE : total_pix + 1u;
 
-	for (uint32_t x = 0; x < IMG_W; ) {
-		if (y == 0 || y == IMG_H - 1u || x == 0 || x == IMG_W - 1u) {
-			for (uint32_t oc = 0; oc < CH; oc++) {
-				float v = conv3_scalar(src, w3_fp + oc * 9 * CH, y, x);
-				row_conv3_out[x * CH + oc] = relu6_f32(v * CONV3_SCALE);
-			}
-			x++;
-		} else {
-			uint32_t npix = (x + 16u <= IMG_W - 1u) ? 16u : (IMG_W - 1u - x);
-			__attribute__((aligned(64))) int32_t tenc_buffer[16 * CH];
+		for (int dy = -1; dy <= 1; ++dy) {
+			for (int dx = -1; dx <= 1; ++dx) {
+				int p = (dy + 1) * 3 + (dx + 1);
 
-			for (int ky = -1; ky <= 1; ky++) {
-				for (int kx = -1; kx <= 1; kx++) {
-					int k = (ky + 1) * 3 + (kx + 1);
+				tensor_load(false, false, 0, 0, 0,
+					    (uint64_t)(w3_int8 + p * CH * 64u),
+					    0, CH - 1u, 64u, 0);
+				tensor_wait(TENSOR_LOAD_WAIT_0);
+
+				for (uint32_t pix0 = st_start; pix0 < st_end; pix0 += MAX_NPIX) {
+					uint32_t pix1 = pix0 + MAX_NPIX < st_end ? pix0 + MAX_NPIX : st_end;
+					uint32_t npix = pix1 - pix0;
+					uint32_t offset = pix0 - st_start;
+
+					uint32_t p_start = (y + dy) * IMG_W + (pix0 + dx);
 					tensor_load(false, false, 0, 0, 1,
-						    (uint64_t)(w3_int8 + k * CH * 64u),
-						    0, CH - 1u, 64u, 1);
+						    (uint64_t)(aint8 + p_start * 64u),
+						    0, npix - 1u, 64u, 1);
 					tensor_wait(TENSOR_LOAD_WAIT_1);
 
-					uint32_t p_start = (y + ky) * IMG_W + (x + kx);
-					tensor_load(false, false, 0, 0, 0,
-						    (uint64_t)(aint8 + p_start * 64u),
-						    0, npix - 1u, 64u, 0);
-					tensor_wait(TENSOR_LOAD_WAIT_0);
-
-					bool first_pass = (k == 0);
-					tensor_fma(false, (CH / 4u) - 1u, npix - 1u,
-						   (CH / 4u) - 1u, 0,
-						   (k == 8), false, false, true,
-						   0, 0, 3, first_pass);
+					tensor_fma(false, (CH / 4u) - 1u, npix - 1u, (CH / 4u) - 1u, offset,
+						   true, false, false, true, 0, 0, 3, p == 0);
 					tensor_wait(TENSOR_FMA_WAIT);
 				}
 			}
+		}
 
-			tensor_store(0, 0, (CH / 4u) - 1u, npix - 1u,
-				     (uint64_t)tenc_buffer, 0, 64u);
+		for (uint32_t pix0 = st_start; pix0 < st_end; pix0 += MAX_NPIX) {
+			uint32_t pix1 = pix0 + MAX_NPIX < st_end ? pix0 + MAX_NPIX : st_end;
+			uint32_t npix = pix1 - pix0;
+			uint32_t offset = pix0 - st_start;
+
+			tensor_store(false, offset, (CH / 4u) - 1u, npix - 1u,
+				     (uint64_t)(dst + (y * IMG_W + pix0) * CH),
+				     0, CH * sizeof(float));
 			tensor_wait(TENSOR_STORE_WAIT);
-
-			for (uint32_t i = 0; i < npix; i++) {
-				for (uint32_t c = 0; c < CH; c++) {
-					float v = (float)tenc_buffer[i * CH + c]
-						  * act_scale * w3_scale[c] * CONV3_SCALE;
-					row_conv3_out[(x + i) * CH + c] = relu6_f32(v);
-				}
-			}
-			x += npix;
 		}
 	}
+}
 
-	__attribute__((aligned(64))) int8_t row_conv3_int8[IMG_W * 64];
-	float mx1 = 0.0f;
-	for (uint32_t x = 0; x < IMG_W; ++x) {
-		for (uint32_t c = 0; c < CH; c++) {
-			float a = row_conv3_out[x * CH + c];
-			if (a < 0.0f) a = -a;
-			if (a > mx1) mx1 = a;
-		}
-	}
-	float scale1 = mx1 == 0.0f ? 1.0f : mx1 / 127.0f;
-	const float inv1 = 1.0f / scale1;
-	for (uint32_t x = 0; x < IMG_W; ++x) {
-		int8_t *const d = row_conv3_int8 + x * 64u;
-		for (uint32_t c = 0; c < CH; ++c)
-			d[c] = clamp_i8(row_conv3_out[x * CH + c] * inv1);
-		for (uint32_t c = CH; c < 64u; ++c) d[c] = 0;
-	}
+static void conv1x1_tfma_t0(
+	const int8_t *aint8, const int8_t *w1_int8,
+	float *dst, uint32_t y)
+{
+	const uint32_t MAX_NPIX = 64u;
 
-	FENCE;
-	evict(row_conv3_int8, IMG_W * 64u);
-	WAIT_CACHEOPS;
+	tensor_load(false, false, 0, 0, 0,
+		    (uint64_t)w1_int8, 0, CH - 1u, 64u, 0);
+	tensor_wait(TENSOR_LOAD_WAIT_0);
 
-	tensor_load(false, false, 0, 0, 1,
-		    (uint64_t)w1_int8, 0, CH - 1u, 64u, 1);
-	tensor_wait(TENSOR_LOAD_WAIT_1);
+	for (uint32_t pix0 = 0; pix0 < IMG_W; pix0 += MAX_NPIX) {
+		uint32_t npix = pix0 + MAX_NPIX <= IMG_W ? MAX_NPIX : (IMG_W - pix0);
 
-	for (uint32_t x = 0; x < IMG_W; x += 16u) {
-		uint32_t npix = (x + 16u <= IMG_W) ? 16u : (IMG_W - x);
-		tensor_load(false, false, 0, 0, 0,
-			    (uint64_t)(row_conv3_int8 + x * 64u),
-			    0, npix - 1u, 64u, 0);
-		tensor_wait(TENSOR_LOAD_WAIT_0);
+		tensor_load(false, false, 0, 0, 1,
+			    (uint64_t)(aint8 + (y * IMG_W + pix0) * 64u),
+			    0, npix - 1u, 64u, 1);
+		tensor_wait(TENSOR_LOAD_WAIT_1);
 
-		tensor_fma(false, (CH / 4u) - 1u, npix - 1u,
-			   (CH / 4u) - 1u, 0,
+		tensor_fma(false, (CH / 4u) - 1u, npix - 1u, (CH / 4u) - 1u, 0,
 			   true, false, false, true, 0, 0, 3, true);
 		tensor_wait(TENSOR_FMA_WAIT);
 
-		__attribute__((aligned(64))) int32_t tenc_buffer[16 * CH];
 		tensor_store(0, 0, (CH / 4u) - 1u, npix - 1u,
-			     (uint64_t)tenc_buffer, 0, 64u);
+			     (uint64_t)(dst + (y * IMG_W + pix0) * CH),
+			     0, CH * sizeof(float));
 		tensor_wait(TENSOR_STORE_WAIT);
+	}
+}
 
-		for (uint32_t i = 0; i < npix; i++) {
+static void dequantize_row_t1(
+	float *dst, const float *w_scale,
+	float act_scale, float conv_scale,
+	uint32_t npix)
+{
+	for (uint32_t i = 0; i < npix; i++) {
+		for (uint32_t c = 0; c < CH; c++) {
+			float v = dst[i * CH + c] * act_scale * w_scale[c] * conv_scale;
+			dst[i * CH + c] = relu6_f32(v);
+		}
+	}
+}
+
+static void pipeline_tfma_layer(
+	uint32_t hart_id, float *src, float *dst, uint8_t *base, uint32_t block,
+	const float *weights, int is_3x3)
+{
+	volatile struct bench_barrier_state *g_barrier =
+		(volatile struct bench_barrier_state *)(base + BARRIER_OFFSET);
+	volatile uint32_t *row_sync =
+		(volatile uint32_t *)(base + BARRIER_OFFSET + 64);
+
+	if (hart_id == 0u) {
+		g_barrier->next_row_max = 0u;
+		g_barrier->next_row_quant = 0u;
+		g_barrier->next_row_conv = 0u;
+		g_barrier->next_row_dequant = 0u;
+		for (uint32_t y = 0; y < IMG_H; y++) row_sync[y] = 0u;
+	}
+	bench_barrier();
+
+	float local_max = 0.0f;
+	while (1) {
+		uint32_t y = __atomic_fetch_add(&g_barrier->next_row_max, 1u, __ATOMIC_RELAXED);
+		if (y >= IMG_H) break;
+		for (uint32_t x = 0; x < IMG_W; x++) {
 			for (uint32_t c = 0; c < CH; c++) {
-				float v = (float)tenc_buffer[i * CH + c]
-					  * scale1 * w1_scale[c] * CONV1_SCALE;
-				output[(y * IMG_W + x + i) * CH + c] = relu6_f32(v);
+				float a = src[(y * IMG_W + x) * CH + c];
+				if (a < 0.0f) a = -a;
+				if (a > local_max) local_max = a;
 			}
 		}
 	}
+	uint32_t raw_max;
+	__builtin_memcpy(&raw_max, &local_max, sizeof(raw_max));
+	g_barrier->reserved[hart_id] = raw_max;
+	row_sync[hart_id] = raw_max;
+	bench_barrier();
 
-	FENCE;
-	evict(output + y * IMG_W * CH, IMG_W * CH * sizeof(float));
+	float global_max = 0.0f;
+	for (uint32_t i = 0; i < ACTIVE_HARTS; i++) {
+		uint32_t m_raw = row_sync[i];
+		float m;
+		__builtin_memcpy(&m, &m_raw, sizeof(m));
+		if (m > global_max) global_max = m;
+	}
+	const float act_scale = global_max == 0.0f ? 1.0f : global_max / 127.0f;
+	const float inv = 1.0f / act_scale;
+
+	if (hart_id == 0u) {
+		for (uint32_t i = 0; i < ACTIVE_HARTS; i++) row_sync[i] = 0u;
+	}
+	bench_barrier();
+
+	int8_t *const aint8 = (int8_t *)(base + AINT8_OFFSET);
+	while (1) {
+		uint32_t y = __atomic_fetch_add(&g_barrier->next_row_quant, 1u, __ATOMIC_RELAXED);
+		if (y >= IMG_H) break;
+		for (uint32_t x = 0; x < IMG_W; ++x) {
+			int8_t *const d = aint8 + (y * IMG_W + x) * 64u;
+			for (uint32_t c = 0; c < CH; ++c)
+				d[c] = clamp_i8(src[(y * IMG_W + x) * CH + c] * inv);
+			for (uint32_t c = CH; c < 64u; ++c) d[c] = 0;
+		}
+		evict(aint8 + y * IMG_W * 64u, IMG_W * 64u);
+	}
 	WAIT_CACHEOPS;
+	bench_barrier();
+
+	if (is_3x3) {
+		const int8_t *const w3_int8 = (const int8_t *)(base + W3_INT8_OFFSET) + block * 9 * CH * 64u;
+		const float *const w3_scale = (const float *)(base + W3_SCALE_OFFSET) + block * CH;
+		const float *const w3_fp = weights + block * BLOCK_WEIGHTS;
+
+		if (bench_hart_is_thread0(hart_id)) {
+			while (1) {
+				uint32_t y = __atomic_fetch_add(&g_barrier->next_row_conv, 1u, __ATOMIC_RELAXED);
+				if (y >= IMG_H) break;
+
+				for (uint32_t oc = 0; oc < CH; ++oc) {
+					dst[y * IMG_W * CH + oc] = conv3_scalar(src, w3_fp + oc * 9 * CH, y, 0);
+					dst[(y * IMG_W + IMG_W - 1u) * CH + oc] = conv3_scalar(src, w3_fp + oc * 9 * CH, y, IMG_W - 1u);
+				}
+
+				conv3x3_tfma_t0(aint8, w3_int8, dst, y);
+
+				FENCE;
+				evict(dst + y * IMG_W * CH, IMG_W * CH * sizeof(float));
+				WAIT_CACHEOPS;
+
+				__atomic_store_n(&row_sync[y], 1u, __ATOMIC_RELEASE);
+			}
+		} else {
+			while (1) {
+				uint32_t y = __atomic_fetch_add(&g_barrier->next_row_dequant, 1u, __ATOMIC_RELAXED);
+				if (y >= IMG_H) break;
+
+				while (__atomic_load_n(&row_sync[y], __ATOMIC_ACQUIRE) == 0u) ;
+
+				dequantize_row_t1(dst + y * IMG_W * CH + CH, w3_scale, act_scale, CONV3_SCALE, IMG_W - 2u);
+
+				for (uint32_t oc = 0; oc < CH; ++oc) {
+					dst[y * IMG_W * CH + oc] = relu6_f32(dst[y * IMG_W * CH + oc] * CONV3_SCALE);
+					dst[(y * IMG_W + IMG_W - 1u) * CH + oc] = relu6_f32(dst[(y * IMG_W + IMG_W - 1u) * CH + oc] * CONV3_SCALE);
+				}
+
+				FENCE;
+				evict(dst + y * IMG_W * CH, IMG_W * CH * sizeof(float));
+				WAIT_CACHEOPS;
+			}
+		}
+	} else {
+		const int8_t *const w1_int8 = (const int8_t *)(base + W1_INT8_OFFSET) + block * CH * 64u;
+		const float *const w1_scale = (const float *)(base + W1_SCALE_OFFSET) + block * CH;
+
+		if (bench_hart_is_thread0(hart_id)) {
+			while (1) {
+				uint32_t y = __atomic_fetch_add(&g_barrier->next_row_conv, 1u, __ATOMIC_RELAXED);
+				if (y >= IMG_H) break;
+
+				conv1x1_tfma_t0(aint8, w1_int8, dst, y);
+
+				FENCE;
+				evict(dst + y * IMG_W * CH, IMG_W * CH * sizeof(float));
+				WAIT_CACHEOPS;
+
+				__atomic_store_n(&row_sync[y], 1u, __ATOMIC_RELEASE);
+			}
+		} else {
+			while (1) {
+				uint32_t y = __atomic_fetch_add(&g_barrier->next_row_dequant, 1u, __ATOMIC_RELAXED);
+				if (y >= IMG_H) break;
+
+				while (__atomic_load_n(&row_sync[y], __ATOMIC_ACQUIRE) == 0u) ;
+
+				dequantize_row_t1(dst + y * IMG_W * CH, w1_scale, act_scale, CONV1_SCALE, IMG_W);
+
+				FENCE;
+				evict(dst + y * IMG_W * CH, IMG_W * CH * sizeof(float));
+				WAIT_CACHEOPS;
+			}
+		}
+	}
+	bench_barrier();
 }
 #endif
 
@@ -1023,89 +1141,10 @@ int main(uintptr_t arg_area)
 			const float *const conv1_w = block_w + CONV3_WEIGHTS;
 
 			#ifdef YOLO_TFMA_INT8
-			if (hart_id == 0u) {
-				g_barrier->next_row_inval = 0u;
-				g_barrier->next_row_max   = 0u;
-				g_barrier->next_row_quant = 0u;
-				g_barrier->next_row_conv  = 0u;
-			}
-			bench_barrier();
-
-			if (bench_hart_is_thread0(hart_id)) {
-				while (1) {
-					uint32_t y = __atomic_fetch_add(
-						&g_barrier->next_row_inval, 1u,
-						__ATOMIC_RELAXED);
-					if (y >= IMG_H) break;
-					evict((const void *)(src + y * IMG_W * CH),
-					      IMG_W * CH * sizeof(float));
-				}
-				WAIT_CACHEOPS;
-			}
-			bench_barrier();
-
-			if (bench_hart_is_thread0(hart_id)) {
-				float local_max = 0.0f;
-				while (1) {
-					uint32_t y = __atomic_fetch_add(
-						&g_barrier->next_row_max, 1u,
-						__ATOMIC_RELAXED);
-					if (y >= IMG_H) break;
-					for (uint32_t x = 0; x < IMG_W; x++) {
-						for (uint32_t c = 0; c < CH; c++) {
-							float a = src[(y * IMG_W + x) * CH + c];
-							if (a < 0.0f) a = -a;
-							if (a > local_max) local_max = a;
-						}
-					}
-				}
-				uint32_t raw_max;
-				__builtin_memcpy(&raw_max, &local_max, sizeof(raw_max));
-				g_barrier->reserved[hart_id / 2u] = raw_max;
-			}
-			bench_barrier();
-
-			float global_max = 0.0f;
-			for (uint32_t i = 0; i < ACTIVE_HARTS / 2u; i++) {
-				uint32_t raw_max = g_barrier->reserved[i];
-				float m;
-				__builtin_memcpy(&m, &raw_max, sizeof(m));
-				if (m > global_max) global_max = m;
-			}
-			const float act_scale = global_max == 0.0f ? 1.0f : global_max / 127.0f;
-			const float inv = 1.0f / act_scale;
-
-			if (bench_hart_is_thread0(hart_id)) {
-				int8_t *const aint8 = (int8_t *)(base + AINT8_OFFSET);
-				while (1) {
-					uint32_t y = __atomic_fetch_add(
-						&g_barrier->next_row_quant, 1u,
-						__ATOMIC_RELAXED);
-					if (y >= IMG_H) break;
-					for (uint32_t x = 0; x < IMG_W; ++x) {
-						int8_t *const d = aint8 + (y * IMG_W + x) * 64u;
-						for (uint32_t c = 0; c < CH; ++c)
-							d[c] = clamp_i8(src[(y * IMG_W + x) * CH + c] * inv);
-						for (uint32_t c = CH; c < 64u; ++c) d[c] = 0;
-					}
-					evict(aint8 + y * IMG_W * 64u, IMG_W * 64u);
-				}
-				WAIT_CACHEOPS;
-			}
-			bench_barrier();
-
-			if (bench_hart_is_thread0(hart_id)) {
-				const int8_t *const aint8 = (const int8_t *)(base + AINT8_OFFSET);
-				while (1) {
-					uint32_t y = __atomic_fetch_add(
-						&g_barrier->next_row_conv, 1u,
-						__ATOMIC_RELAXED);
-					if (y >= IMG_H) break;
-					conv3x3_fused_tfma_row(base, src, aint8,
-							       block, dst, y, act_scale);
-				}
-			}
-			bench_barrier();
+			pipeline_tfma_layer(hart_id, src, dst, base, block, weights, 1);
+			src = dst;
+			dst = (dst == act0) ? act1 : act0;
+			pipeline_tfma_layer(hart_id, src, dst, base, block, weights, 0);
 			#else
 			evict_activation_read_float(src, row0, row1);
 			WAIT_CACHEOPS;
