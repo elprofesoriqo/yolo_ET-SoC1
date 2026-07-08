@@ -1,11 +1,3 @@
-/*
- * YOLO-shaped Erbium VPU FP32 benchmark.
- *
- * This is not a full YOLO model parser.  It isolates the hot shape that matters
- * first for a small YOLO-style detector: repeated 3x3 + 1x1 channel mixing on
- * an 80x80 feature map, followed by a 1x1 detection head.
- */
-
 #include <stdint.h>
 
 #include "erbium/isa/atomic.h"

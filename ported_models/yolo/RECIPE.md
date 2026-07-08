@@ -8,7 +8,3 @@
 
 ## Dead Ends
 * Investigated using the INT8 TFMA pipeline, but optimizing the FP32 vector engine's memory bandwidth proved significantly more effective for this workload.
-
-## Verification
-* Passed `.github/ci/scripts/ci_preflight.sh` (with a minor fix to upstream's `leaderboard_gate.py`).
-* Real-world latency is verified via the board CI runner.
